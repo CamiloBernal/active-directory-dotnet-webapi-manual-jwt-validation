@@ -32,17 +32,13 @@ using System.Net;
 using System.IdentityModel.Selectors;
 using System.Security.Claims;
 using System.Net.Http.Headers;
-using System.IdentityModel.Metadata;
-using System.ServiceModel.Security;
-using System.Xml;
-using System.Security.Cryptography.X509Certificates;
 using System.Globalization;
 using System.Configuration;
 using Microsoft.IdentityModel.Protocols;
 
 namespace TodoListService_ManualJwt
 {
-    public class WebApiApplication : System.Web.HttpApplication
+    public class WebApiApplication : HttpApplication
     {
         protected void Application_Start()
         {
@@ -63,44 +59,37 @@ namespace TodoListService_ManualJwt
         // The Authority is the sign-in URL of the tenant.
         // The Audience is the value the service expects to see in tokens that are addressed to it.
         //
-        static string aadInstance = ConfigurationManager.AppSettings["ida:AADInstance"];
-        static string tenant = ConfigurationManager.AppSettings["ida:Tenant"];
-        static string audience = ConfigurationManager.AppSettings["ida:Audience"];
-        string authority = String.Format(CultureInfo.InvariantCulture, aadInstance, tenant);
+        private static readonly string AadInstance = ConfigurationManager.AppSettings["ida:AADInstance"];
+        private static readonly string Tenant = ConfigurationManager.AppSettings["ida:Tenant"];
+        private static readonly string Audience = ConfigurationManager.AppSettings["ida:Audience"];
+        private readonly string _authority = string.Format(CultureInfo.InvariantCulture, AadInstance, Tenant);
 
-        static string _issuer = string.Empty;
-        static List<SecurityToken> _signingTokens = null;
-        static DateTime _stsMetadataRetrievalTime = DateTime.MinValue;
-        static string scopeClaimType = "http://schemas.microsoft.com/identity/claims/scope";
-        
+        private static string _issuer = string.Empty;
+        private static IList<SecurityToken> _signingTokens;
+        private static DateTime _stsMetadataRetrievalTime = DateTime.MinValue;
+        private const string ScopeClaimType = "http://schemas.microsoft.com/identity/claims/scope";
+
         //
         // SendAsync checks that incoming requests have a valid access token, and sets the current user identity using that access token.
         //
-        protected async override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
-            string authHeader = null;
+            // Get the jwt bearer token from the authorization header
             string jwtToken = null;
-            string issuer;
-            string stsDiscoveryEndpoint = string.Format("{0}/.well-known/openid-configuration", authority);
-
-            List<SecurityToken> signingTokens;
-
-            // The header is of the form "bearer <accesstoken>", so extract to the right of the whitespace to find the access token.
-            authHeader = HttpContext.Current.Request.Headers["Authorization"];
+            var authHeader = request.Headers.Authorization;
             if (authHeader != null)
             {
-                int startIndex = authHeader.LastIndexOf(' ');
-                if (startIndex > 0)
-                {
-                    jwtToken = authHeader.Substring(startIndex).Trim();
-                }
+                jwtToken = authHeader.Parameter;
             }
 
             if (jwtToken == null)
             {
-                HttpResponseMessage response = BuildResponseErrorMessage(HttpStatusCode.Unauthorized);
+                var response = BuildResponseErrorMessage(HttpStatusCode.Unauthorized);
                 return response;
             }
+
+            string issuer;
+            ICollection<SecurityToken> signingTokens;
 
             try
             {
@@ -110,8 +99,9 @@ namespace TodoListService_ManualJwt
                     || _signingTokens == null)
                 {
                     // Get tenant information that's used to validate incoming jwt tokens
-                    ConfigurationManager<OpenIdConnectConfiguration> configManager = new ConfigurationManager<OpenIdConnectConfiguration>(stsDiscoveryEndpoint);
-                    OpenIdConnectConfiguration config = await configManager.GetConfigurationAsync();
+                    string stsDiscoveryEndpoint = $"{_authority}/.well-known/openid-configuration";
+                    var configManager = new ConfigurationManager<OpenIdConnectConfiguration>(stsDiscoveryEndpoint);
+                    var config = await configManager.GetConfigurationAsync(cancellationToken);
                     _issuer = config.Issuer;
                     _signingTokens = config.SigningTokens.ToList();
                     
@@ -126,11 +116,11 @@ namespace TodoListService_ManualJwt
                 return new HttpResponseMessage(HttpStatusCode.InternalServerError);
             }
 
-            JwtSecurityTokenHandler tokenHandler = new JwtSecurityTokenHandler();
+            var tokenHandler = new JwtSecurityTokenHandler();
 
-            TokenValidationParameters validationParameters = new TokenValidationParameters
+            var validationParameters = new TokenValidationParameters
             {
-                ValidAudience = audience,
+                ValidAudience = Audience,
                 ValidIssuer = issuer,
                 IssuerSigningTokens = signingTokens,
                 CertificateValidator = X509CertificateValidator.None
@@ -139,8 +129,8 @@ namespace TodoListService_ManualJwt
             try
             {
                 // Validate token.
-                SecurityToken validatedToken = new JwtSecurityToken();
-                ClaimsPrincipal claimsPrincipal = tokenHandler.ValidateToken(jwtToken, validationParameters, out validatedToken);
+                SecurityToken validatedToken;
+                var claimsPrincipal = tokenHandler.ValidateToken(jwtToken, validationParameters, out validatedToken);
 
                 // Set the ClaimsPrincipal on the current thread.
                 Thread.CurrentPrincipal = claimsPrincipal;
@@ -152,17 +142,15 @@ namespace TodoListService_ManualJwt
                 }
 
                 // If the token is scoped, verify that required permission is set in the scope claim.
-                if (ClaimsPrincipal.Current.FindFirst(scopeClaimType) != null && ClaimsPrincipal.Current.FindFirst(scopeClaimType).Value != "user_impersonation")
-                {
-                    HttpResponseMessage response = BuildResponseErrorMessage(HttpStatusCode.Forbidden);
-                    return response;
-                }
-
-                return await base.SendAsync(request, cancellationToken);
+                if (ClaimsPrincipal.Current.FindFirst(ScopeClaimType) == null ||
+                    ClaimsPrincipal.Current.FindFirst(ScopeClaimType).Value == "user_impersonation")
+                    return await base.SendAsync(request, cancellationToken);
+                var response = BuildResponseErrorMessage(HttpStatusCode.Forbidden);
+                return response;
             }
             catch (SecurityTokenValidationException)
             {
-                HttpResponseMessage response = BuildResponseErrorMessage(HttpStatusCode.Unauthorized);
+                var response = BuildResponseErrorMessage(HttpStatusCode.Unauthorized);
                 return response;
             }
             catch (Exception)
@@ -173,12 +161,12 @@ namespace TodoListService_ManualJwt
 
         private HttpResponseMessage BuildResponseErrorMessage(HttpStatusCode statusCode)
         {
-            HttpResponseMessage response = new HttpResponseMessage(statusCode);
+            var response = new HttpResponseMessage(statusCode);
 
             //
             // The Scheme should be "Bearer", authorization_uri should point to the tenant url and resource_id should point to the audience.
             //
-            AuthenticationHeaderValue authenticateHeader = new AuthenticationHeaderValue("Bearer", "authorization_uri=\"" + authority + "\"" + "," + "resource_id=" + audience);
+            var authenticateHeader = new AuthenticationHeaderValue("Bearer", "authorization_uri=\"" + _authority + "\"" + "," + "resource_id=" + Audience);
 
             response.Headers.WwwAuthenticate.Add(authenticateHeader);
 
